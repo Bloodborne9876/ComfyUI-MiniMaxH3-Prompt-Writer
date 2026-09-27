@@ -8,6 +8,9 @@ import types
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import unquote
+
+from aiohttp.test_utils import TestClient, TestServer
 
 
 class _FakeRoutes:
@@ -77,12 +80,30 @@ class _MultipartRequest(_Request):
 class RouteStabilityTests(unittest.IsolatedAsyncioTestCase):
     session_id = "11111111-2222-4333-8444-555555555555"
 
+    async def test_workflow_download_preserves_mime_filename_and_bytes_over_http(self):
+        with tempfile.TemporaryDirectory() as directory:
+            asset = {"filename": "My recording.ogg", "content_revision": 0}
+            app = routes.web.Application()
+            app.router.add_get("/media/{asset_id}", routes.media_content)
+            with patch.object(routes.STORE, "get", return_value=asset):
+                async with TestClient(TestServer(app)) as client:
+                    for extension, mime in [("ogg", "audio/ogg"), ("mp3", "audio/mpeg"), ("png", "image/png")]:
+                        path = Path(directory) / f"original.{extension}"
+                        path.write_bytes(b"unchanged media bytes")
+                        asset["_original_path"] = str(path)
+                        async with client.get(f"/media/a?session_id={self.session_id}&kind=workflow&revision=0") as response:
+                            self.assertEqual(response.status, 200)
+                            self.assertEqual(response.content_type, mime)
+                            self.assertEqual(await response.read(), path.read_bytes())
+                            self.assertEqual(unquote(response.headers["Content-Disposition"]),
+                                             f"inline; filename*=UTF-8''My recording.{extension}")
+
     async def test_workflow_media_returns_original_or_applied_bytes_with_content_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             original, applied = Path(directory) / "original.mp4", Path(directory) / "applied.mp4"
             original.write_bytes(b"original video")
             applied.write_bytes(b"applied video")
-            asset = {"_original_path": str(original), "_contact_sheet_path": "sheet.png", "content_revision": 2, "status": "needs_edit"}
+            asset = {"filename": "My clip.mov", "_original_path": str(original), "_contact_sheet_path": "sheet.png", "content_revision": 2, "status": "needs_edit"}
             request = _Request(query={"session_id": self.session_id, "kind": "workflow", "revision": "2"}, match_info={"asset_id": "a"})
             with patch.object(routes.STORE, "get", return_value=asset):
                 response = await routes.media_content(request)
@@ -91,6 +112,7 @@ class RouteStabilityTests(unittest.IsolatedAsyncioTestCase):
                 asset["_edited_path"] = str(applied)
                 response = await routes.media_content(request)
                 self.assertEqual(response._path, applied)
+                self.assertEqual(unquote(response.headers["Content-Disposition"]), "inline; filename*=UTF-8''My clip.mp4")
                 self.assertEqual(response.headers["X-H3PS-Content-Hash"], hashlib.sha256(applied.read_bytes()).hexdigest())
                 asset["content_revision"] = 3
                 with self.assertRaises(routes.web.HTTPConflict):

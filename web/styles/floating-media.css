@@ -1,4 +1,5 @@
 .h3ps-root.h3ps-media-float { inset:auto; z-index:9500; width:min(410px,calc(100vw - 16px)); max-height:calc(100dvh - 16px); border:1px solid var(--h3ps-border); border-radius:var(--h3ps-radius-lg); background:var(--h3ps-surface); box-shadow:var(--h3ps-shadow); overflow:hidden; }
+.h3ps-root.h3ps-media-float:not([data-theme="light"]) { box-shadow:none; }
 .h3ps-media-float.is-open { display:flex; flex-direction:column; }
 .h3ps-float-header { display:flex; align-items:center; gap:8px; flex:none; padding:8px 10px; border-bottom:1px solid var(--h3ps-border); background:var(--h3ps-chrome); cursor:move; touch-action:none; user-select:none; }
 .h3ps-float-header strong { font-size:var(--h3ps-font-body); }

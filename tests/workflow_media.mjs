@@ -1,197 +1,284 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import { Window } from "happy-dom";
+import {
+  workflowMediaSnapshot, createMediaMaterializer, createFileDropEvent,
+  createWorkflowMediaTransfer, clampPanelPosition,
+} from "../web/workflow_media.js";
 
-const source = await readFile(new URL("../web/workflow_media.js", import.meta.url), "utf8");
-const { workflowMediaSnapshot, supportedLoader, loaderWidget, createMediaMaterializer,
-  createWorkflowMediaTransfer, clampPanelPosition } = await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
-const definitions = {
-  LoadImage: { python_module: "nodes", input: { required: { image: [["old.png"], { image_upload: true }] } } },
-  LoadImageMask: { python_module: "nodes", input: { required: { image: [["old.png"], { image_upload: true }] } } },
-  LoadVideo: { python_module: "comfy_extras.nodes_video", input: { required: { file: ["COMBO", { video_upload: true }] } } },
-  LoadAudio: { python_module: "comfy_extras.nodes_audio", input: { required: { audio: ["COMBO", { audio_upload: true }] } } },
-  VHS_LoadVideo: { python_module: "custom_nodes.comfyui-videohelpersuite", input: { required: { video: [["old.mp4"]] } } },
-};
-const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
-const file = { value: "prompt-writer/pw-test.mp4" };
-function harness(type = null, materialize = async () => file) {
-  let id = 0, hit = null, revision = 0;
-  const changes = [];
-  function makeNode(type) {
-    const name = Object.keys(definitions[type].input.required)[0];
-    const node = { id: ++id, type, inputs: [], outputs: [{ links: [42] }], preview: "old",
-      widgets: [{ name, type: "combo", value: "old", options: { values: ["old"] }, callback(value) { node.preview = value; } }],
-      onWidgetChanged(...args) { changes.push(args); } };
-    return node;
-  }
-  const graph = { _nodes: [], getNodeOnPos: () => hit, getNodeById: id => graph._nodes.find(n => n.id === id),
-    add(n) { graph._nodes.push(n); }, remove(n) { graph._nodes.splice(graph._nodes.indexOf(n), 1); },
-    beforeChange() {}, afterChange() {}, setDirtyCanvas() {} };
-  const app = { canvas: { graph }, clientPosToCanvasPos: ([x, y]) => [x / 2, y / 2] };
-  const liteGraph = { registered_node_types: Object.fromEntries(Object.entries(definitions).map(([k, nodeData]) => [k, { nodeData }])), createNode: makeNode };
-  if (type) { hit = makeNode(type); graph.add(hit); }
-  const transfer = createWorkflowMediaTransfer({ app, liteGraph, materialize, getWorkflowRevision: () => revision });
-  return { app, graph, liteGraph, transfer, node: hit, changes, switchWorkflow() { revision++; } };
+function deferred() {
+  let resolve;
+  const promise = new Promise(done => { resolve = done; });
+  return { promise, resolve };
 }
 
-test("workflow snapshots use original/applied content, including staged media, never sheet or draft", () => {
+function harness(type = null, materialize = async () => new File(["original bytes"], "picture.png", { type: "image/png" })) {
+  let id = 0, hit = null, revision = 0, currentMedia = true;
+  const received = [];
+  function makeNode(type) {
+    return {
+      id: ++id, type, outputs: [{ links: [] }],
+      widgets: [{ name: "custom_source", value: "old" }, { name: "other_setting", value: 16 }],
+      async onDragDrop(event) {
+        const file = event.dataTransfer.files[0];
+        received.push({ node: this, event, file });
+        this.widgets[0].value = file.name;
+        this.preview = { filename: file.name, type: file.type };
+        return true;
+      },
+    };
+  }
+  const graph = {
+    _nodes: [], changes: [], getNodeOnPos: () => hit,
+    getNodeById: id => graph._nodes.find(node => node.id === id),
+    add(node) { graph._nodes.push(node); },
+    remove(node) { graph._nodes.splice(graph._nodes.indexOf(node), 1); },
+    beforeChange() { graph.changes.push("before"); },
+    afterChange() { graph.changes.push("after"); },
+    setDirtyCanvas() {},
+  };
+  const canvas = {};
+  const app = { canvas: { graph, canvas }, clientPosToCanvasPos: ([x, y]) => [x / 2, y / 2] };
+  const liteGraph = {
+    registered_node_types: { LoadImage: {}, LoadVideo: {}, LoadAudio: {} },
+    createNode: makeNode,
+  };
+  if (type) {
+    hit = makeNode(type);
+    hit.outputs[0].links.push(42);
+    graph.add(hit);
+  }
+  const transfer = createWorkflowMediaTransfer({
+    app, liteGraph, materialize,
+    getWorkflowRevision: () => revision,
+    isCurrentMedia: () => currentMedia,
+    createDropEvent: (file, point, element) => ({
+      dataTransfer: { types: ["Files"], files: [file] },
+      clientX: point[0], clientY: point[1], target: element,
+    }),
+  });
+  return {
+    app, canvas, graph, liteGraph, transfer, node: hit, received,
+    switchWorkflow() { revision++; },
+    changeMedia() { currentMedia = false; },
+  };
+}
+
+test("workflow snapshots select original/applied media, never a preview or an unapplied draft", () => {
   for (const type of ["image", "video", "audio"]) {
-    const asset = { id: "a", session_id: "s", type, content_url: "/original", preview_url: "/sheet", draft: "/draft", status: "needs_edit", content_revision: 4 };
+    const asset = { id: "a", session_id: "s", type, content_url: "/original", preview_url: "/sheet", content_revision: 4 };
     const snapshot = workflowMediaSnapshot(asset);
     assert.equal(snapshot.kind, type);
     assert.match(snapshot.url, /kind=workflow&revision=4$/);
-    assert.doesNotMatch(snapshot.url, /sheet|draft/);
+    assert.doesNotMatch(snapshot.url, /sheet/);
     assert.notEqual(workflowMediaSnapshot({ ...asset, content_revision: 5 }).url, snapshot.url);
   }
   assert.equal(workflowMediaSnapshot({ type: "image" }), null);
 });
 
-test("loader adapters are exact, including VHS Upload but not arbitrary video nodes", () => {
-  for (const [type, kind] of [["LoadImage", "image"], ["LoadImageMask", "image"], ["LoadVideo", "video"], ["LoadAudio", "audio"], ["VHS_LoadVideo", "video"]]) {
-    assert.ok(supportedLoader(type, definitions[type], kind));
-    assert.equal(supportedLoader(type, { ...definitions[type], python_module: "custom" }, kind), null);
-  }
-  assert.equal(supportedLoader("VHS_LoadVideoPath", definitions.VHS_LoadVideo, "video"), null);
-  assert.equal(supportedLoader("LoadImage", definitions.LoadImage, "video"), null);
-  const h = harness("LoadImage"), adapter = supportedLoader("LoadImage", definitions.LoadImage, "image");
-  h.node.inputs.push({ name: "image", link: null });
-  assert.ok(loaderWidget(h.node, adapter));
-  h.node.inputs[0].link = 42;
-  assert.equal(loaderWidget(h.node, adapter), null);
+test("unknown custom loaders own file upload, preview updates and unrelated widgets", async () => {
+  const h = harness("ThirdPartyLoaderNotKnownToWriter");
+  const originalWidgets = h.node.widgets;
+  assert.equal(await h.transfer.drop({ kind: "image" }, [100, 200]), h.node);
+  assert.equal(h.received.length, 1);
+  assert.equal(h.received[0].node, h.node);
+  assert.equal(await h.received[0].file.text(), "original bytes");
+  assert.deepEqual(h.node.preview, { filename: "picture.png", type: "image/png" });
+  assert.equal(h.node.widgets, originalWidgets);
+  assert.equal(h.node.widgets[1].value, 16);
+  assert.deepEqual(h.node.outputs[0].links, [42]);
+  assert.equal(h.graph._nodes.length, 1);
+  assert.deepEqual(h.graph.changes, ["before", "after"]);
 });
 
-test("empty-canvas drops create one native node at converted coordinates for each media kind", async () => {
+test("empty canvas creates the standard loader and calls only its file handler", async () => {
   for (const [kind, type] of [["image", "LoadImage"], ["video", "LoadVideo"], ["audio", "LoadAudio"]]) {
     const h = harness();
+    h.app.handleFile = () => assert.fail("Must not import PNG workflow metadata");
+    h.canvas.dispatchEvent = () => assert.fail("Must not broadcast drop to the canvas");
     const node = await h.transfer.drop({ kind }, [100, 200]);
-    assert.equal(node.type, type); assert.deepEqual(node.pos, [50, 100]);
-    assert.equal(h.graph._nodes.length, 1); assert.equal(node.widgets[0].value, file.value);
+    assert.equal(node.type, type);
+    assert.deepEqual(node.pos, [50, 100]);
+    assert.equal(h.graph._nodes.length, 1);
+    assert.equal(h.received.length, 1);
   }
 });
 
-test("native and VHS replacement preserve identity, links and unrelated widgets", async () => {
-  for (const [type, kind] of [["LoadImage", "image"], ["LoadVideo", "video"], ["LoadAudio", "audio"], ["VHS_LoadVideo", "video"]]) {
-    const h = harness(type); h.node.widgets.push({ name: "frame_load_cap", value: 16 });
-    assert.equal(await h.transfer.drop({ kind }, [0, 0]), h.node);
-    assert.deepEqual(h.node.outputs, [{ links: [42] }]);
-    assert.equal(h.node.widgets[1].value, 16); assert.equal(h.node.preview, file.value);
-    assert.equal(h.changes.length, 1); assert.equal(h.graph._nodes.length, 1);
+test("a node DOM preview is accepted, but unrelated overlays cannot create or replace loaders", async () => {
+  const h = harness("CustomPreviewLoader");
+  const preview = {};
+  h.node.widgets.push({ element: { contains: element => element === preview } });
+  await h.transfer.drop({ kind: "image" }, [0, 0], undefined, preview);
+  assert.equal(h.received[0].event.target, preview);
+  await assert.rejects(h.transfer.drop({ kind: "image" }, [0, 0], undefined, {}), /workflow canvas/);
+  const empty = harness();
+  await assert.rejects(empty.transfer.drop({ kind: "image" }, [0, 0], undefined, {}), /workflow canvas/);
+  assert.equal(empty.graph._nodes.length, 0);
+});
+
+test("unsupported and busy receivers and read-only graphs reject before reading media", async () => {
+  for (const change of [
+    h => { h.node.onDragDrop = undefined; },
+    h => { h.node.isUploading = true; },
+    h => { h.app.canvas.read_only = true; },
+    h => { h.app.canvas.allow_interaction = false; },
+  ]) {
+    const h = harness("CustomLoader", () => assert.fail("Unsupported target must not read media"));
+    change(h);
+    await assert.rejects(h.transfer.drop({ kind: "image" }, [0, 0]));
+    assert.equal(h.graph._nodes.length, 1);
   }
 });
 
-test("unsupported, read-only, disabled and converted targets do not materialize", async () => {
-  for (const change of [h => h.node.type = "Unknown", h => h.app.canvas.read_only = true,
-    h => h.app.canvas.allow_interaction = false, h => h.node.widgets[0].disabled = true,
-    h => h.node.inputs.push({ name: "image", link: 42 })]) {
-    let uploads = 0; const h = harness("LoadImage", async () => { uploads++; return file; }); change(h);
-    await assert.rejects(h.transfer.drop({ kind: "image" }, [0, 0])); assert.equal(uploads, 0);
+test("a refused or failed handler never falls back to canvas import or another node", async () => {
+  for (const handler of [() => false, () => { throw Error("upload failed"); }]) {
+    const h = harness("CustomLoader");
+    h.node.onDragDrop = handler;
+    await assert.rejects(h.transfer.drop({ kind: "image" }, [0, 0]));
+    assert.equal(h.graph._nodes.length, 1);
+    assert.equal(h.node.widgets[0].value, "old");
+    assert.deepEqual(h.node.outputs[0].links, [42]);
+    assert.deepEqual(h.graph.changes, ["before", "after"]);
+
+    const empty = harness();
+    const makeNode = empty.liteGraph.createNode;
+    empty.liteGraph.createNode = type => ({ ...makeNode(type), onDragDrop: handler });
+    await assert.rejects(empty.transfer.drop({ kind: "image" }, [0, 0]));
+    assert.equal(empty.graph._nodes.length, 0);
   }
 });
 
-test("upload races do not mutate a changed graph or target", async () => {
-  for (const change of [h => h.app.canvas.graph = {}, h => h.switchWorkflow(), h => h.graph.remove(h.node),
-    h => h.node.widgets[0].value = "user.png", h => h.app.canvas.read_only = true, h => h.graph._nodes = []]) {
-    const wait = deferred(), h = harness("LoadImage", () => wait.promise);
-    const pending = h.transfer.drop({ kind: "image" }, [0, 0]); change(h); wait.resolve(file);
-    await assert.rejects(pending); assert.notEqual(h.node.widgets[0].value, file.value);
+test("graph, receiver and media changes during file preparation prevent delivery", async () => {
+  for (const change of [
+    h => { h.app.canvas.graph = {}; }, h => h.switchWorkflow(), h => h.changeMedia(),
+    h => h.graph.remove(h.node), h => { h.graph._nodes = []; },
+    h => { h.node.widgets[0].value = "user-choice.png"; },
+    h => { h.node.onDragDrop = () => true; }, h => { h.node.isUploading = true; },
+    h => { h.app.canvas.read_only = true; },
+  ]) {
+    const wait = deferred();
+    const h = harness("CustomLoader", () => wait.promise);
+    const pending = h.transfer.drop({ kind: "image" }, [0, 0]);
+    change(h);
+    wait.resolve(new File(["bytes"], "picture.png"));
+    await assert.rejects(pending);
+    assert.equal(h.received.length, 0);
   }
 });
 
-test("cancelled upload can be followed immediately by a fresh transfer", async () => {
-  const old = deferred(); let calls = 0;
-  const h = harness(null, () => ++calls === 1 ? old.promise : Promise.resolve(file));
+test("cancelled preparation can be replaced without the old job delivering its file", async () => {
+  const wait = deferred();
+  let calls = 0;
+  const h = harness(null, () => ++calls === 1 ? wait.promise : new File(["new"], "new.png"));
   const controller = new AbortController();
   const pending = h.transfer.drop({ kind: "image" }, [0, 0], controller.signal);
   controller.abort();
-  await h.transfer.drop({ kind: "video" }, [20, 30], new AbortController().signal);
-  old.resolve(file); await assert.rejects(pending, { name: "AbortError" });
-  assert.equal(h.graph._nodes.length, 1); assert.equal(h.graph._nodes[0].type, "LoadVideo");
+  await h.transfer.drop({ kind: "image" }, [0, 0]);
+  wait.resolve(new File(["old"], "old.png"));
+  await assert.rejects(pending, { name: "AbortError" });
+  assert.equal(h.graph._nodes.length, 1);
+  assert.equal(h.received[0].file.name, "new.png");
 });
 
-test("callback failures restore the old source, preview and change notification", async () => {
-  const h = harness("VHS_LoadVideo");
-  h.node.widgets[0].callback = value => { h.node.preview = value; if (value === file.value) throw Error("preview failure"); };
-  await assert.rejects(h.transfer.drop({ kind: "video" }, [0, 0]), /preview failure/);
-  assert.equal(h.node.widgets[0].value, "old"); assert.equal(h.node.preview, "old");
-  assert.deepEqual(h.node.widgets[0].options.values, ["old"]); assert.equal(h.changes.at(-1)[1], "old");
-  assert.deepEqual(h.node.outputs, [{ links: [42] }]);
-  const empty = harness();
-  const make = empty.liteGraph.createNode;
-  empty.liteGraph.createNode = type => { const n = make(type); n.widgets[0].callback = () => { throw Error("failure"); }; return n; };
-  await assert.rejects(empty.transfer.drop({ kind: "image" }, [0, 0])); assert.equal(empty.graph._nodes.length, 0);
-});
-
-test("cancellation during an asynchronous callback rolls back only this transfer", async () => {
-  const h = harness("LoadImage"), wait = deferred(), started = deferred(), controller = new AbortController();
-  h.node.widgets[0].callback = value => { h.node.preview = value; if (value === file.value) { started.resolve(); return wait.promise; } };
+test("an already dispatched third-party upload finishes once and cannot overlap another transfer", async () => {
+  const wait = deferred(), started = deferred(), controller = new AbortController();
+  const h = harness("CustomLoader");
+  h.node.onDragDrop = async () => { started.resolve(); await wait.promise; return true; };
   const pending = h.transfer.drop({ kind: "image" }, [0, 0], controller.signal);
-  await started.promise; controller.abort(); wait.resolve(); await assert.rejects(pending);
-  assert.equal(h.node.preview, "old"); assert.equal(h.node.widgets[0].value, "old");
+  await started.promise;
+  controller.abort();
+  await assert.rejects(h.transfer.drop({ kind: "image" }, [0, 0]), /Finish the current/);
+  wait.resolve();
+  assert.equal(await pending, h.node);
+  assert.deepEqual(h.node.outputs[0].links, [42]);
 });
 
-test("VHS preview separates the subfolder without changing source or other controls", async () => {
-  for (const extension of ["mp4", "webm", "gif", "webp", "avif"]) {
-    const value = `prompt-writer/nested/clip.${extension}`;
-    const h = harness("VHS_LoadVideo", async () => ({ value }));
-    const preview = { name: "videopreview", value: { params: { force_rate: 12 } } };
-    h.node.widgets.push(preview);
-    const order = [];
-    h.node.widgets[0].callback = v => { order.push("callback"); Object.assign(preview.value.params, { filename: v }); };
-    h.node.onWidgetChanged = () => order.push("change");
-    h.node.updateParameters = (params, force) => { order.push("preview"); assert.equal(force, true); Object.assign(preview.value.params, params); };
-    await h.transfer.drop({ kind: "video" }, [0, 0]);
-    assert.equal(h.node.widgets[0].value, value);
-    assert.deepEqual(preview.value.params, { force_rate: 12, filename: `clip.${extension}`, subfolder: "prompt-writer/nested", type: "input",
-      format: `${["gif", "webp", "avif"].includes(extension) ? "image" : "video"}/${extension}` });
-    assert.deepEqual(order, ["callback", "change", "preview"]);
-    assert.deepEqual(h.node.outputs, [{ links: [42] }]);
-  }
-  const h = harness("LoadVideo");
-  h.node.updateParameters = () => assert.fail("Native loaders must not receive a VHS preview update");
-  await h.transfer.drop({ kind: "video" }, [0, 0]);
-});
-
-test("VHS preview failure rolls back both subfolder and root-input sources", async () => {
-  for (const old of ["old.mp4", "previous/old.webm"]) {
-    const h = harness("VHS_LoadVideo"); h.node.widgets[0].value = old;
-    const params = { filename: old, type: "input", force_rate: 12, subfolder: "" };
-    h.node.widgets.push({ name: "videopreview", value: { params } });
-    h.node.widgets[0].callback = value => { params.filename = value; };
-    h.node.updateParameters = next => { Object.assign(params, next); if (next.filename === "pw-test.mp4") throw Error("preview failed"); };
-    await assert.rejects(h.transfer.drop({ kind: "video" }, [0, 0]), /preview failed/);
-    assert.equal(h.node.widgets[0].value, old);
-    assert.equal(params.filename, old.split("/").at(-1));
-    assert.equal(params.subfolder, old.includes("/") ? "previous" : "");
-    assert.equal(params.force_rate, 12); assert.equal(params.type, "input");
-    assert.equal(h.changes.at(-1)[1], old);
-    assert.deepEqual(h.node.outputs, [{ links: [42] }]);
-  }
-});
-
-test("materialization preserves bytes and stable names without browser hashing or overwrite", async () => {
-  const bodies = []; let revision = "a";
-  const upload = createMediaMaterializer(async (url, options) => {
-    if (url === "/upload/image") { bodies.push(options.body); return Response.json({ type: "input", subfolder: "prompt-writer", name: options.body.get("image").name }); }
-    return new Response("video bytes", { headers: { "Content-Type": "video/mp4", "X-H3PS-Content-Hash": revision.repeat(64) } });
+test("materialization preserves bytes and readable filenames without a second upload", async () => {
+  const calls = [];
+  const readFile = createMediaMaterializer(async url => {
+    calls.push(url);
+    return new Response("PNG including workflow metadata", {
+      headers: { "Content-Type": "image/png", "Content-Disposition": "inline; filename*=UTF-8''My%20photo.png" },
+    });
   });
-  const a = await upload({ url: "/a" }), b = await upload({ url: "/a" }); revision = "b";
-  const c = await upload({ url: "/b" });
-  assert.equal(a.value, b.value); assert.notEqual(a.value, c.value);
-  assert.match(a.value, /^prompt-writer\/pw-/);
-  assert.equal(await bodies[0].get("image").text(), "video bytes"); assert.equal(bodies[0].has("overwrite"), false);
-  assert.doesNotMatch(source, /crypto\.subtle|arrayBuffer|handleFile/);
+  const a = await readFile({ url: "/original", filename: "My photo.png" });
+  const b = await readFile({ url: "/original", filename: "My photo.png" });
+  const c = await readFile({ url: "/edited", filename: "My photo.jpg" });
+  assert.equal(a.name, "pw-My photo.png");
+  assert.equal(a.name, b.name);
+  assert.equal(c.name, "pw-My photo.png", "Applied content format determines the extension");
+  assert.equal(a.type, "image/png");
+  assert.equal(await a.text(), "PNG including workflow metadata");
+  assert.deepEqual(calls, ["/original", "/original", "/edited"]);
   await assert.rejects(createMediaMaterializer(async () => new Response("", { status: 409 }))({ url: "/stale" }), /Media changed/);
 });
 
-test("panel stays non-modal, viewport-clamped and wired through one independent entry point", async () => {
-  const main = await readFile(new URL("../web/main.js", import.meta.url), "utf8");
+test("server-provided audio metadata reaches new and existing file receivers", async () => {
+  for (const [extension, contentType] of [["ogg", "audio/ogg"], ["wav", "audio/wav"], ["mp3", "audio/mpeg"]]) {
+    const materialize = createMediaMaterializer(async () => new Response("OggS original audio", {
+      headers: { "Content-Type": contentType, "Content-Disposition": `inline; filename*=UTF-8''My%20recording.${extension}` },
+    }));
+    for (const type of [null, "VHS_LoadAudioUpload"]) {
+      const h = harness(type, materialize);
+      const received = [];
+      const onDragDrop = async event => {
+        const file = event.dataTransfer.files[0];
+        if (!event.dataTransfer.types.includes("Files") || file.type !== contentType) return false;
+        received.push(file);
+        return true;
+      };
+      if (h.node) h.node.onDragDrop = onDragDrop;
+      else {
+        const createNode = h.liteGraph.createNode;
+        h.liteGraph.createNode = type => ({ ...createNode(type), onDragDrop });
+      }
+      await h.transfer.drop({ kind: "audio", url: "/audio", filename: "My recording.ogg" }, [0, 0]);
+      assert.equal(h.graph._nodes.length, 1);
+      assert.equal(received[0].name, `pw-My recording.${extension}`);
+      assert.equal(await received[0].text(), "OggS original audio");
+    }
+  }
+});
+
+test("upload names decode server metadata safely; missing metadata requests a restart", async () => {
+  const materialize = createMediaMaterializer(async () => new Response("image", {
+    headers: { "Content-Type": "image/png", "Content-Disposition": "inline; filename*=UTF-8''C%3A%5Cphotos%5CMy%3A%20image%3F.png" },
+  }));
+  assert.equal((await materialize({})).name, "pw-My_ image_.png");
+  const stale = createMediaMaterializer(async () => new Response("image"));
+  await assert.rejects(stale({}), /Restart ComfyUI/);
+});
+
+test("file drop events contain Files only and cannot bubble to workflow importers", t => {
+  const window = new Window();
+  const originals = { DataTransfer: globalThis.DataTransfer, DragEvent: globalThis.DragEvent };
+  // happy-dom's DragEvent does not implement the dataTransfer constructor member.
+  class FileDragEvent extends window.MouseEvent {
+    constructor(type, options) {
+      super(type, options);
+      this.dataTransfer = options.dataTransfer;
+    }
+  }
+  Object.assign(globalThis, { DataTransfer: window.DataTransfer, DragEvent: FileDragEvent });
+  t.after(() => Object.assign(globalThis, originals));
+  const element = window.document.createElement("canvas");
+  const file = new window.File(["original"], "example.png", { type: "image/png" });
+  const event = createFileDropEvent(file, [12, 34], element);
+  assert.equal(event.dataTransfer.files[0], file);
+  assert.equal(event.dataTransfer.files.length, 1);
+  assert.equal(event.dataTransfer.getData("text/uri-list"), "");
+  assert.equal(event.target, element);
+  assert.equal(event.bubbles, false);
+  assert.equal(event.clientX, 12);
+});
+
+test("panel remains non-modal and bounded; transfer code never invokes a workflow importer", async () => {
   const panel = await readFile(new URL("../web/floating_media.js", import.meta.url), "utf8");
-  const opening = main.slice(main.indexOf("function supportsWorkflowMedia"), main.indexOf("function openStudio"));
-  assert.doesNotMatch(opening, /VRAM_HANDOFF_SUPPORTED/);
-  assert.match(opening, /Add media first/); assert.match(main, /<strong>Media panel<\/strong><small>ADD TO WORKFLOW/);
-  assert.match(main, /querySelectorAll\("\[data-open-floating-media\]"\)/);
+  const source = await readFile(new URL("../web/workflow_media.js", import.meta.url), "utf8");
   assert.match(panel, /application\/x-h3ps-workflow-media/);
-  assert.match(panel, /pending\?\.abort/); assert.match(panel, /stopImmediatePropagation/);
-  assert.doesNotMatch(panel, /aria-modal|backdrop|handleFile/);
+  assert.match(panel, /stopImmediatePropagation/);
+  assert.doesNotMatch(panel, /aria-modal|backdrop/);
+  assert.doesNotMatch(source, /dispatchEvent|handleFile|loadGraphData|updateParameters|VHS_/);
   assert.deepEqual(clampPanelPosition({ x: 999, y: -20 }, { width: 800, height: 600 }, { width: 410, height: 200 }), { x: 382, y: 8 });
 });

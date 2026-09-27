@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Improved Media Panel drops onto custom media loaders, using each loader's own upload and preview handling ([#37](https://github.com/duckyshell/ComfyUI-MiniMaxH3-Prompt-Writer/issues/37)).
+
 ## 0.4.7 - 2026-09-26
 
 - Fixed ComfyUI keyboard shortcuts remaining blocked after closing Writer's media tools, and made the launcher's keyboard focus easier to see ([#36](https://github.com/duckyshell/ComfyUI-MiniMaxH3-Prompt-Writer/issues/36)).

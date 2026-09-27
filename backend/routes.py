@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import mimetypes
 import shutil
 import sys
 import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import quote
 from uuid import uuid4
 
 from aiohttp import web
@@ -1171,6 +1173,10 @@ async def media_content(request: web.Request) -> web.StreamResponse:
             if revision != int(current.get("content_revision", current.get("sample_index", 0))):
                 raise web.HTTPConflict(text="Media changed during transfer. Drop the current version again.")
             headers["Cache-Control"] = "no-store"
+            # FileResponse's private MIME table can omit formats known to Python's registry.
+            headers["Content-Type"] = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+            filename = Path(asset.get("filename") or path.name).stem + path.suffix
+            headers["Content-Disposition"] = f"inline; filename*=UTF-8''{quote(filename, safe='')}"
         elif kind == "frame":
             index = int(request.query.get("index", "0"))
             path = Path(asset["_frames"][index]["path"])

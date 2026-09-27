@@ -31,10 +31,6 @@ export function createFloatingMediaPanel({ app, getState, transfer, icon, openWr
   function isOurDrag(event) {
     return !!dragging && Array.from(event.dataTransfer?.types || []).includes(DRAG_TYPE);
   }
-  function canvasTarget(event) {
-    // DOM overlays and custom widgets are deliberately not treated as empty canvas.
-    return event.target === app.canvas?.canvas;
-  }
   function refresh() {
     const state = getState();
     root.dataset.theme = state.theme;
@@ -74,9 +70,10 @@ export function createFloatingMediaPanel({ app, getState, transfer, icon, openWr
       event.stopImmediatePropagation();
       event.preventDefault();
       let supported = false;
-      if (canvasTarget(event)) {
-        try { transfer.destination(dragging.snapshot.kind, [event.clientX, event.clientY]); supported = true; } catch {}
-      }
+      try {
+        transfer.destination(dragging.snapshot.kind, [event.clientX, event.clientY], event.target);
+        supported = true;
+      } catch {}
       event.dataTransfer.dropEffect = supported ? "copy" : "none";
     }, options);
     document.addEventListener("drop", async event => {
@@ -84,11 +81,11 @@ export function createFloatingMediaPanel({ app, getState, transfer, icon, openWr
       event.preventDefault(); event.stopImmediatePropagation();
       const snapshot = dragging.snapshot;
       dragging = null;
-      if (!canvasTarget(event)) { notice("Drop on the workflow canvas or a compatible media loader."); return; }
+      const element = event.target;
       const controller = new AbortController(); pending = controller;
       notice("Sending media to workflow…");
       try {
-        await transfer.drop(snapshot, [event.clientX, event.clientY], controller.signal);
+        await transfer.drop(snapshot, [event.clientX, event.clientY], controller.signal, element);
         if (!controller.signal.aborted) notice("Media sent. Later Writer edits will not change this loader.");
       } catch (error) {
         if (!controller.signal.aborted) notice(error.message || "Media transfer failed.");

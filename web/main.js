@@ -3844,11 +3844,12 @@ async function openFloatingMedia() {
     if (!current.floatingMedia) {
       current.floatingMediaPending ||= Promise.all([
         import("./floating_media.js"), import("./workflow_media.js"), import("/scripts/api.js"),
-      ]).then(([{ createFloatingMediaPanel }, { createWorkflowMediaTransfer, createMediaMaterializer }, { api }]) => {
+      ]).then(([{ createFloatingMediaPanel }, { createWorkflowMediaTransfer, createMediaMaterializer, workflowMediaSnapshot }, { api }]) => {
         current.floatingMedia = createFloatingMediaPanel({
           app, getState: () => current, icon, openWriter: openStudio,
           transfer: createWorkflowMediaTransfer({ app, liteGraph: window.LiteGraph,
             getWorkflowRevision: () => workflowRevision,
+            isCurrentMedia: snapshot => workflowMediaSnapshot(current.assets.find(asset => asset.id === snapshot.id))?.url === snapshot.url,
             materialize: createMediaMaterializer((...args) => api.fetchApi(...args)) }),
         });
       }).finally(() => { current.floatingMediaPending = null; });

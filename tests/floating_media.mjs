@@ -58,7 +58,7 @@ function fixture(t) {
     await root.emit("dragstart", { target: root.cards.children[0], dataTransfer });
     return dataTransfer;
   }
-  return { panel, root, state, doc, win, canvas, stored, transfers, drag };
+  return { panel, root, state, doc, win, canvas, stored, transfer, transfers, drag };
 }
 
 test("floating panel follows theme/size, retains position, and suspends with Writer", async t => {
@@ -79,6 +79,30 @@ test("floating panel follows theme/size, retains position, and suspends with Wri
   f.panel.open(); assert.equal(f.root.style.left, position);
   globalThis.innerWidth = 430; await f.win.emit("resize"); assert.equal(f.root.style.left, "12px");
   f.panel.destroy(); assert.equal(f.root.removed, true);
+});
+
+test("Writer drops are consumed even on rejection; unrelated file drops are untouched", async t => {
+  const f = fixture(t);
+  f.panel.open();
+  let prevented = 0, stopped = 0;
+  const event = {
+    target: f.canvas,
+    preventDefault() { prevented++; },
+    stopImmediatePropagation() { stopped++; },
+  };
+  await f.doc.emit("drop", { ...event, dataTransfer: { types: ["Files"] } });
+  assert.equal(prevented, 0);
+  assert.equal(stopped, 0);
+  assert.equal(f.transfers.length, 0);
+
+  f.transfer.drop = async () => { throw Error("Receiver refused file"); };
+  const dataTransfer = await f.drag();
+  await f.doc.emit("drop", { ...event, dataTransfer });
+  assert.equal(prevented, 1);
+  assert.equal(stopped, 1);
+  assert.match(f.root.status.textContent, /Receiver refused/);
+  assert.equal(f.transfers.length, 0);
+  f.panel.destroy();
 });
 
 test("close or suspend aborts a transfer; reopening permits a new drop without stale feedback", async t => {
