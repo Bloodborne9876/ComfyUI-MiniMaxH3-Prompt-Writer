@@ -167,8 +167,16 @@ class GenerationCharacterizationTests(unittest.TestCase):
             self.assertFalse(aborted.wait(0.3))
             cancel_event.set()
             self.assertTrue(aborted.wait(1))
+            # A new completion can clear the abort flag after media processing.
+            aborted.clear()
+            self.assertTrue(aborted.wait(1))
         aborted.clear()
         self.assertFalse(aborted.wait(0.3))
+
+        # A later request must not inherit cancellation from the previous one.
+        cancel_event.clear()
+        with _abort_when_cancelled(cancel_event, _Abortable()):
+            self.assertFalse(aborted.wait(0.3))
 
     def test_manual_generation_budget_caps_each_thinking_and_fallback_request(self):
         backend = _CharacterizedBackend([
